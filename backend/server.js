@@ -1,36 +1,42 @@
-import express from "express";
+import express from 'express';
+import cors from 'cors';
+import { env } from './src/config/env.js';
+import { initDb } from './src/config/db.js';
+import transactionRouter from './src/routes/transaction.route.js';
+import { rateLimiter } from './src/middleware/rateLimiter.js';
+import { errorHandler } from './src/middleware/errorHandler.js';
+
 const app = express();
+
+// Middleware registration
 app.use(express.json());
-
-import "dotenv/config";
-const PORT = process.env.PORT || 5001;
-
-import cors from "cors";
 app.use(cors());
+app.use('/api', rateLimiter);
 
-import { sql } from "./src/config/db.js";
-const initDb = async () => {
-  try {
-    await sql`CREATE TABLE IF NOT EXISTS transactions (
-      id SERIAL PRIMARY KEY,
-      user_id VARCHAR(255) NOT NULL,
-      title VARCHAR(255) NOT NULL,
-      amount DECIMAL(10,2) NOT NULL,
-      category VARCHAR(255) NOT NULL,
-      created_at DATE NOT NULL DEFAULT CURRENT_DATE
-    )`;
-    console.log("Database initialized");
-  } catch (error) {
-    console.log(error);
+// Router registration
+app.use('/api/transactions', transactionRouter);
+
+// Global error handler registration
+app.use(errorHandler);
+
+// Server startup and DB initialization
+const startServer = async () => {
+  await initDb();
+
+  const server = app.listen(env.port, () => {
+    console.log(`Server started on port ${env.port} (${env.nodeEnv} mode)`);
+  });
+
+  server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+      console.error(
+        `Port ${env.port} is already in use. Please check if another process is running or change the PORT in your .env file.`,
+      );
+    } else {
+      console.error('Server error:', error);
+    }
     process.exit(1);
-  }
+  });
 };
 
-import transactionRouter from "./src/routes/transaction.route.js";
-app.use("/api/transactions", transactionRouter);
-
-initDb().then(() => {
-  app.listen(PORT, () => {
-    console.log(`Server started on port ${PORT}`);
-  });
-});
+startServer();
