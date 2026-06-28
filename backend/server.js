@@ -5,6 +5,7 @@ import { initDb } from './src/config/db.js';
 import transactionRouter from './src/routes/transaction.route.js';
 import { rateLimiter } from './src/middleware/rateLimiter.js';
 import { errorHandler } from './src/middleware/errorHandler.js';
+import job from './src/utils/cron.js';
 
 const app = express();
 
@@ -18,6 +19,14 @@ app.use('/api/transactions', transactionRouter);
 
 // Global error handler registration
 app.use(errorHandler);
+
+//cron job if at production
+if (env.nodeEnv === 'production') {
+  job.start();
+}
+app.get('/api/health', (req, res) => {
+  res.json({ message: 'OK' });
+});
 
 // Server startup and DB initialization
 const startServer = async () => {

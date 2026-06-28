@@ -11,8 +11,9 @@ export const env = {
   port: process.env.PORT || 3001,
   databaseUrl: process.env.DATABASE_URL,
   nodeEnv: process.env.NODE_ENV || 'development',
+  apiUrl: process.env.API_URL,
   rateLimit: {
     windowMs: 30 * 60 * 1000, // 30 minutes
-    max: 50, // Maximum 50 requests
+    max: process.env.NODE_ENV === 'production' ? 50 : 5000, // Maximum 50 requests in prod, 5000 in dev
   },
 };

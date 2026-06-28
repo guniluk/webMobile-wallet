@@ -1,448 +1,468 @@
 # 🔐 Clerk 인증(Authentication) 도입 및 풀스택(웹/모바일) 연동 가이드
 
-본 문서는 프로젝트에서 **Clerk** 서비스를 활용하여 웹(React)과 모바일(Expo) 프론트엔드를 구축하고, 이를 Node.js Express 백엔드 및 MongoDB 데이터베이스와 동기화하기 위한 전체 과정과 연동 절차를 단계별로 상세히 안내합니다.
+본 문서는 프로젝트에서 **Clerk** 서비스를 활용하여 이메일(Email)과 비밀번호(Password) 기반의 회원가입/로그인을 구현하고, 모바일(Expo) 및 백엔드(Node.js Express + MongoDB) 간에 인증 정보를 완전하게 동기화하기 위한 전체 과정과 트러블슈팅 가이드를 단계별로 상세히 기술합니다.
 
 ---
 
 ## 📌 전체 흐름 시퀀스 다이어그램
 
+이메일과 비밀번호를 이용해 회원가입(OTP 인증) 및 로그인을 처리하고 백엔드 DB와 연동하는 흐름은 다음과 같습니다.
+
 ```mermaid
+%%{init: { 'theme': 'base', 'themeVariables': { 'primaryTextColor': '#FFFFFF', 'actorTextColor': '#000000', 'noteTextColor': '#000000', 'signalTextColor': '#FFFFFF', 'labelTextColor': '#FFFFFF', 'loopTextColor': '#FFFFFF' }}}%%
 sequenceDiagram
     actor User as 사용자
-    participant FE_Web as 웹 프론트엔드 (React)
-    participant FE_Mobile as 모바일 앱 (Expo)
+    participant App as 모바일 앱 (Expo)
     participant Clerk as Clerk Auth Service
     participant BE as 백엔드 (Express API)
     participant DB as MongoDB
     
-    Note over User, Clerk: [로그인 및 토큰 획득]
-    alt 웹 브라우저 접속
-        User->>FE_Web: 로그인 버튼 클릭 (Clerk UI)
-        FE_Web->>Clerk: 로그인 요청 및 소셜 인증 수행
-        Clerk-->>FE_Web: JWT 인증 토큰 발급 및 리다이렉트
-    else 모바일 앱 접속
-        User->>FE_Mobile: Google / 소셜 로그인 버튼 클릭
-        FE_Mobile->>Clerk: 웹 브라우저 세션을 통한 OAuth 인증
-        Clerk-->>FE_Mobile: JWT 인증 토큰 발급 및 앱 복귀 (Deep Link)
-    end
+    %% 회원가입 흐름
+    Note over User, Clerk: [1단계: 이메일/비밀번호 회원가입 & OTP 인증]
+    User->>App: 이메일, 비밀번호 입력 & 가입 요청
+    App->>Clerk: signUp.create({ emailAddress, password })
+    Clerk-->>App: 가입 요청 접수 (status: missing_requirements)
+    App->>Clerk: signUp.verifications.sendEmailCode() (6자리 인증코드 발송)
+    Clerk-->>User: 이메일로 6자리 인증 코드 발송
+    User->>App: 이메일로 수신한 6자리 코드 입력
+    App->>Clerk: signUp.verifications.verifyEmailCode({ code })
+    Clerk-->>App: 인증 완료 및 계정 활성화 (signUp.status: complete)
+    App->>Clerk: setActive({ session: signUp.createdSessionId }) (세션 활성화)
+    Clerk-->>App: JWT 토큰 발급 및 로컬 SecureStore 저장
 
-    Note over User, DB: [백엔드 DB 회원 동기화 (최초 로그인 시)]
-    alt 웹 최초 로그인 (Callback)
-        FE_Web->>BE: GET /api/auth/callback (Bearer JWT 토큰 첨부)
-    else 모바일 최초 로그인 (Callback)
-        FE_Mobile->>BE: GET /api/auth/callback (Bearer JWT 토큰 첨부)
+    %% 로그인 및 추가 인증 흐름
+    Note over User, Clerk: [2단계: 로그인 & 추가 본인인증(필요시)]
+    User->>App: 이메일, 비밀번호 입력 & 로그인 요청
+    App->>Clerk: signIn.create({ identifier, password })
+    
+    alt 즉시 로그인 성공
+        Clerk-->>App: 로그인 완료 (signIn.status: complete)
+    else 이메일 추가 인증 필요 (needs_first_factor)
+        Clerk-->>App: 추가 인증 필요 응답 (signIn.status: needs_first_factor)
+        App->>Clerk: signIn.prepareFirstFactor({ strategy: 'email_code', ... })
+        Clerk-->>User: 이메일로 6자리 일회용 코드 발송
+        User->>App: 6자리 코드 입력
+        App->>Clerk: signIn.attemptFirstFactor({ strategy: 'email_code', code })
+        Clerk-->>App: 로그인 최종 완료 (signIn.status: complete)
     end
+    
+    App->>Clerk: setActive({ session: signIn.createdSessionId }) (세션 활성화)
+    Clerk-->>App: JWT 토큰 발급 및 로컬 SecureStore 저장
 
+    %% 백엔드 DB 회원 동기화
+    Note over App, DB: [3단계: 백엔드 DB 회원 정보 동기화]
+    App->>BE: GET /api/auth/callback (Bearer JWT 토큰 헤더 첨부)
     BE->>BE: protectRoute 미들웨어에서 Clerk JWT 토큰 디코딩 & 검증
-    BE->>DB: 해당 유저 가입 여부 조회 (clerkId 기반)
-    alt 신규 유저인 경우 (최초 로그인)
-        BE->>DB: Clerk 프로필 정보를 기반으로 신규 가입 처리 (User.create)
+    BE->>DB: clerkId 기반 가입 여부 조회
+    alt 신규 회원인 경우
+        BE->>DB: Clerk 프로필 정보를 DB에 동적 복사 & 회원 테이블 생성 (User.create)
     end
-    BE-->>FE_Web: 가입/로그인 동기화 완료 응답
-    BE-->>FE_Mobile: 가입/로그인 동기화 완료 응답
+    BE-->>App: 가입/로그인 동기화 완료 응답
+    App->>App: 메인 대시보드 화면(Index) 진입
 ```
 
 ---
 
 ## 1단계. Clerk 공식 사이트(Clerk Dashboard) 설정
 
-풀스택 연동을 시작하기 전에 Clerk 대시보드에서 애플리케이션을 생성하고 API Key를 발급받아야 합니다.
+이메일/비밀번호 인증이 정상 작동하려면 Clerk 대시보드에서 필수 및 허용 수단을 알맞게 활성화해야 합니다.
 
-1. **Clerk 가입 및 대시보드 진입**:
-   - [Clerk 공식 홈페이지](https://clerk.com)에 회원가입 후 Dashboard로 이동합니다.
-2. **신규 프로젝트(Application) 생성**:
-   - `Create application` 버튼을 클릭합니다.
-   - 애플리케이션 이름(예: `Spotify-Clone`)을 입력합니다.
-   - 활성화할 인증 수단을 선택합니다:
-     - **Email address** 및 **Google** 소셜 로그인을 선택합니다. (필요 시 Apple 등 추가)
-   - `Create Application`을 클릭해 생성을 완료합니다.
-3. **API Key 확인 및 복사**:
-   - 대시보드의 **API Keys** 메뉴로 이동합니다.
-   - 다음 두 가지 키를 별도로 메모해 둡니다:
-     - **Publishable Key**: 프론트엔드(웹/모바일)에서 사용할 공개 키 (형식: `pk_test_...`)
-     - **Secret Key**: 백엔드(Express)에서 사용할 비밀 키 (형식: `sk_test_...`)
-4. **소셜 로그인(OAuth) Redirect URI 설정 (모바일 앱용)**:
-   - 모바일 앱에서 Clerk 소셜 로그인을 사용하려면, 앱이 인증 완료 후 되돌아올 **Deep Link Scheme**(예: `myapp://redirect` 또는 `exp://`)을 Clerk Dashboard의 **User & Authentication > Social Connections** 설정 내 **Redirect URL** 혹은 앱 환경 설정에 등록해 주어야 합니다.
+1. **프로젝트 생성**:
+   - [Clerk Dashboard](https://clerk.com)에서 새로운 Application을 생성합니다.
+2. **이메일 및 패스워드 설정 활성화**:
+   - **User & Authentication > Sign-up** 메뉴로 이동합니다.
+   - **Contact info**에서 **Email address**를 활성화하고, **Required**에 체크하여 회원가입 시 이메일 주소를 필수로 수집하도록 설정합니다.
+   - **Authentication factors**에서 **Password**를 활성화하고 **Required**에 체크하여 가입 시 비밀번호 입력을 강제합니다.
+3. **이메일 인증(OTP) 활성화**:
+   - **User & Authentication > Sign-up** 내 **Verification** 설정에서 이메일 주소 인증 방식으로 **Email code**를 활성화합니다. (가입자가 입력한 이메일로 6자리 핀코드를 발송하는 기능).
+4. **API Key 획득**:
+   - **API Keys** 메뉴로 이동해 프로젝트에 적용할 키를 복사합니다:
+     - **Publishable Key**: `pk_test_...` (프론트엔드 환경 변수에 사용)
+     - **Secret Key**: `sk_test_...` (백엔드 `.env` 파일에 사용)
 
 ---
 
-## 2단계. 웹 프론트엔드(Web Frontend - React) 설정 및 구현
+## 2단계. 모바일 프론트엔드(Mobile - Expo) 설정 및 구현
 
-클라이언트 사이드에서 Clerk SDK를 주입하고, 로그인 상태에 따라 UI를 분기하며 토큰을 백엔드로 전달하는 흐름을 잡습니다.
+모바일 앱에서 이메일/비밀번호 회원가입, 6자리 이메일 코드 인증, 로그인 및 2차 인증을 핸들링하는 네이티브 화면을 구성합니다.
 
-### 1) 의존성 설치
-프론트엔드 폴더(`frontend/`) 경로에서 React용 Clerk SDK를 설치합니다.
-```bash
-cd frontend
-npm install @clerk/react
-```
-
-### 2) 환경 변수 등록
-`frontend/.env.local` 파일을 생성(또는 수정)하고 Clerk 대시보드에서 가져온 Publishable Key를 입력합니다.
-```env
-VITE_CLERK_PUBLISHABLE_KEY=pk_test_...
-```
-*(Vite 앱에서는 접두사 `VITE_`가 붙은 변수만 클라이언트 코드에서 인식 가능합니다)*
-
-### 3) 최상위 프로바이더 설정 (`main.tsx` 또는 `App.tsx` 부근)
-React 앱 전체에 로그인 세션 상태를 공급하기 위해 `ClerkProvider`로 엔트리포인트를 랩핑해야 합니다.
-```typescript
-import { ClerkProvider } from "@clerk/react";
-
-const clerkPublishableKey = import.meta.env.VITE_CLERK_PUBLISHABLE_KEY;
-
-if (!clerkPublishableKey) {
-  throw new Error("Missing Publishable Key");
-}
-
-export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
-  return (
-    <ClerkProvider publishableKey={clerkPublishableKey}>
-      {children}
-    </ClerkProvider>
-  );
-};
-```
-
-### 4) 로그인 분기 컴포넌트 활용
-Clerk가 제공하는 빌트인 컴포넌트를 사용해 로그인한 유저에게만 특정 메뉴나 페이지를 보여줍니다.
-- `<SignedIn>`: 로그인 상태인 유저에게만 자식 요소를 노출합니다.
-- `<SignedOut>`: 로그아웃 상태인 유저에게만 자식 요소를 노출합니다.
-- `<UserButton>`: Clerk가 제공하는 프로필 이미지 아바타로, 클릭 시 로그아웃 및 계정 관리 팝업이 내장되어 있습니다.
-
-### 5) 백엔드 요청을 위한 JWT 토큰 가로채기 (Axios Interceptor)
-로그인한 유저는 모든 백엔드 API를 요청할 때 **Clerk이 인증한 JWT 토큰(Bearer Token)**을 헤더에 실어 보내야 합니다.
-`frontend/src/lib/axios.ts`에서 다음과 같이 구성합니다:
-```typescript
-import axios from "axios";
-
-export const axiosInstance = axios.create({
-  baseURL: import.meta.env.DEV ? "http://localhost:3000/api" : "/api",
-});
-
-// 모든 요청 직전에 Clerk 세션 토큰을 획득해 Authorization 헤더에 Bearer 토큰으로 삽입
-export const setAxiosToken = (token: string | null) => {
-  if (token) {
-    axiosInstance.defaults.headers.common["Authorization"] = `Bearer ${token}`;
-  } else {
-    delete axiosInstance.defaults.headers.common["Authorization"];
+### 1) 네이티브 환경 설정 (`app.json`)
+네이티브 모듈(예: SecureStore) 연동 및 iOS 시뮬레이터 구동을 위해 고유한 번들 식별자(`bundleIdentifier`)를 명시해 주어야 합니다.
+```json
+{
+  "expo": {
+    "name": "mobile",
+    "slug": "mobile",
+    "scheme": "mobile",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.guniluk.mobile"
+    },
+    "android": {
+      "package": "com.guniluk.mobile",
+      "predictiveBackGestureEnabled": false
+    },
+    "plugins": [
+      "expo-router",
+      "@clerk/expo",
+      "expo-secure-store",
+      "expo-web-browser"
+    ]
   }
-};
+}
 ```
+> [!IMPORTANT]
+> iOS 시뮬레이터에서 앱을 띄우려면 `ios.bundleIdentifier`가 필수적입니다. 누락 시 `CommandError: Required property 'ios.bundleIdentifier' is not found` 에러가 발생합니다.
 
-### 6) 최초 로그인 시 백엔드 DB 가입 동기화 (`/auth-callback`)
-로그인이 완료되면 프론트엔드는 `/auth-callback` 페이지로 리다이렉트되어 즉시 백엔드의 동기화 API를 호출합니다:
+### 2) 안전한 Custom Token Cache 구축 (`app/_layout.tsx`)
+세션 토큰을 시뮬레이터 및 실기기 보안 영역에 무한 대기(Pending) 없이 안정적으로 캐싱하도록 `expo-secure-store`를 활용하여 구성합니다.
 ```typescript
-// AuthCallbackPage.tsx 내부 동작 예시
-const { getToken } = useAuth();
-
-useEffect(() => {
-  const syncUser = async () => {
-    try {
-      const token = await getToken();
-      setAxiosToken(token); // 토큰 헤더 적용
-      
-      // 백엔드에 회원 가입 동기화 요청
-      await axiosInstance.get("/auth/callback"); 
-      navigate("/"); // 동기화 완료 시 홈으로 이동
-    } catch (error) {
-      console.error("User sync failed", error);
-    }
-  };
-  syncUser();
-}, [getToken, navigate]);
-```
-
----
-
-## 3단계. 모바일 프론트엔드(Mobile Frontend - Expo) 설정 및 구현
-
-모바일(Expo) 환경에서는 네이티브 보안 저장소를 통해 세션 토큰을 안전하게 유지하고, 웹 브라우저를 띄워 소셜 로그인(SSO)을 처리한 뒤 앱으로 복귀하는 구현 방식을 채택합니다.
-
-### 1) 의존성 설치
-모바일 폴더(`mobile/` 또는 React Native 프로젝트 루트) 경로에서 필요한 패키지들을 설치합니다.
-```bash
-cd mobile
-# Clerk Expo SDK와 토큰 영구 저장을 위한 Secure Store 설치
-npx expo install @clerk/expo expo-secure-store
-# 소셜 로그인을 위한 브라우저 제어 및 딥링크 지원 패키지 설치
-npx expo install expo-web-browser expo-linking
-```
-
-### 2) 환경 변수 등록 (`.env`)
-Expo 프로젝트 루트에 `.env` 파일을 생성하고 Clerk Publishable Key를 정의합니다.
-```env
-EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...
-```
-*(Expo SDK 49 이상 버전에서는 `EXPO_PUBLIC_` 접두사를 붙여야 클라이언트 코드에서 자동으로 불러올 수 있습니다)*
-
-### 3) Secure Store를 이용한 Token Cache 설정
-Clerk가 세션 토큰을 안전하게 로컬 디바이스에 보관(Token Persistence)하도록 돕는 캐시 객체를 만듭니다.
-`mobile/src/utils/tokenCache.ts` (또는 적절한 위치) 파일을 생성합니다:
-```typescript
-import * as SecureStore from 'expo-secure-store';
+import * as SecureStore from "expo-secure-store";
 
 export const tokenCache = {
   async getToken(key: string) {
     try {
       const item = await SecureStore.getItemAsync(key);
       if (item) {
-        console.log(`${key} was used 🔐 \n`);
+        console.log(`🔑 Token retrieved successfully for key: ${key}`);
       } else {
-        console.log('No values stored under key: ' + key);
+        console.log(`ℹ️ No token found for key: ${key}`);
       }
       return item;
     } catch (error) {
-      console.error('SecureStore get item error: ', error);
-      await SecureStore.deleteItemAsync(key);
+      console.error("❌ SecureStore get item error: ", error);
+      await SecureStore.deleteItemAsync(key).catch(() => {});
       return null;
     }
   },
   async saveToken(key: string, value: string) {
     try {
-      return SecureStore.setItemAsync(key, value);
+      console.log(`💾 Saving token for key: ${key}...`);
+      await SecureStore.setItemAsync(key, value);
+      console.log(`✅ Token saved successfully for key: ${key}`);
     } catch (err) {
-      return;
+      console.error("❌ SecureStore save item error: ", err);
     }
   },
 };
 ```
+> [!NOTE]
+> 기본 내장 캐시 라이브러리는 시뮬레이터 기기상의 세션 저장(setActive) 시점에 완료를 반환하지 않고 영구 정지(로딩 스핀 고정)되는 버그가 있으므로, 반드시 위와 같이 예외 처리가 반영된 커스텀 `tokenCache`를 사용하십시오.
 
-### 4) `app.json`에 Scheme 및 플러그인 등록
-소셜 로그인 완료 후 웹 브라우저에서 앱으로 정상 리다이렉트(딥링크)되도록 `app.json`에 `scheme`과 플러그인을 설정합니다.
-```json
-{
-  "expo": {
-    "name": "SpotifyClone",
-    "slug": "spotify-clone",
-    "scheme": "spotifyclone", // 앱 고유의 딥링크 스킴
-    "plugins": [
-      "expo-secure-store"
-    ],
-    "extra": {
-      "eas": {
-        "projectId": "your-project-id"
-      }
-    }
-  }
-}
-```
+### 3) 이메일/비밀번호 회원가입 및 OTP 인증 (`sign-up.jsx`)
+가입 정보를 입력받아 계정을 사전 등록하고, 이메일로 발송된 6자리 코드를 입력받아 검증을 완료합니다.
+```javascript
+import React, { useState } from "react";
+import { View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator } from "react-native";
+import { useSignUp, useClerk } from "@clerk/expo";
+import { useRouter } from "expo-router";
 
-### 5) 최상위 레이아웃 구성 (`app/_layout.tsx`)
-Expo Router의 Root Layout 파일에서 `ClerkProvider`를 연동하고 초기 상태 로딩을 처리합니다.
-```tsx
-import { ClerkProvider, ClerkLoaded } from '@clerk/expo';
-import { Slot } from 'expo-router';
-import { tokenCache } from '../src/utils/tokenCache';
+export default function SignUpScreen() {
+  const { signUp, isLoaded: isSignUpLoaded } = useSignUp();
+  const { setActive } = useClerk();
+  const router = useRouter();
 
-const publishableKey = process.env.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY!;
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [pendingVerification, setPendingVerification] = useState(false);
+  const [verificationCode, setVerificationCode] = useState("");
+  const [loading, setLoading] = useState(false);
 
-if (!publishableKey) {
-  throw new Error('EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY를 .env 파일에 설정해 주세요.');
-}
-
-export default function RootLayout() {
-  return (
-    <ClerkProvider publishableKey={publishableKey} tokenCache={tokenCache}>
-      <ClerkLoaded>
-        <Slot />
-      </ClerkLoaded>
-    </ClerkProvider>
-  );
-}
-```
-
-### 6) `useSSO`를 통한 소셜 로그인 구현 (`SignIn.tsx`)
-Clerk의 최신 권장 방식인 `useSSO` 훅과 `expo-web-browser`를 활용하여 Google 로그인 구현 예시입니다.
-```tsx
-import React from 'react';
-import * as WebBrowser from 'expo-web-browser';
-import * as Linking from 'expo-linking';
-import { useSSO } from '@clerk/expo';
-import { Button, View, StyleSheet } from 'react-native';
-
-// 브라우저 인증 세션 종료 후 원활한 처리를 위해 반드시 필요
-WebBrowser.maybeCompleteAuthSession();
-
-export default function SignInScreen() {
-  const { startSSOFlow } = useSSO();
-
-  // 브라우저가 미리 켜지도록 워밍업(Warm-up) 설정하여 딜레이 제거
-  React.useEffect(() => {
-    void WebBrowser.warmUpAsync();
-    return () => {
-      void WebBrowser.coolDownAsync();
-    };
-  }, []);
-
-  const onPressGoogleSignIn = React.useCallback(async () => {
+  // 1단계: 계정 생성 및 인증코드 전송
+  const handleSignUp = async () => {
+    if (!isSignUpLoaded || !signUp) return;
+    setLoading(true);
     try {
-      // app.json에 설정된 scheme에 따라 리다이렉트 URL 동적 빌드
-      const redirectUrl = Linking.createURL('/oauth-callback', { scheme: 'spotifyclone' });
-      
-      const { createdSessionId, setActive } = await startSSOFlow({
-        strategy: 'oauth_google',
-        redirectUrl,
-      });
+      await signUp.create({ emailAddress: email, password });
+      await signUp.verifications.sendEmailCode(); // 6자리 메일 발송
+      setPendingVerification(true);
+      Alert.alert("인증 코드 발송", "이메일로 6자리 인증 코드가 전송되었습니다.");
+    } catch (err) {
+      const errorMsg = err.errors?.[0]?.message || "회원가입 요청에 실패했습니다.";
+      Alert.alert("회원가입 실패", errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
 
-      if (createdSessionId && setActive) {
-        // 세션 활성화 및 로컬 SecureStore 저장
-        await setActive({ session: createdSessionId });
+  // 2단계: OTP 코드 인증 및 최종 가입 완료
+  const handleVerify = async () => {
+    if (!signUp) return;
+    setLoading(true);
+    try {
+      await signUp.verifications.verifyEmailCode({ code: verificationCode });
+      
+      // 훅 자체의 signUp.status가 complete가 되었는지 검사
+      if (signUp.status === "complete") {
+        await setActive({ session: signUp.createdSessionId }); // 세션 활성화 및 토큰 저장
+        router.replace("/");
+      } else {
+        Alert.alert("알림", "가입 상태가 완료되지 않았습니다.");
       }
     } catch (err) {
-      console.error('OAuth / SSO 에러 발생:', err);
+      const errorMsg = err.errors?.[0]?.message || "잘못된 인증 코드입니다.";
+      Alert.alert("인증 실패", errorMsg);
+    } finally {
+      setLoading(false);
     }
-  }, [startSSOFlow]);
+  };
 
   return (
-    <View style={styles.container}>
-      <Button title="Google 계정으로 로그인" onPress={onPressGoogleSignIn} />
+    <View>
+      {!pendingVerification ? (
+        // 회원가입 입력 UI
+        <View>
+          <TextInput placeholder="이메일" value={email} onChangeText={setEmail} autoCapitalize="none" />
+          <TextInput placeholder="비밀번호" value={password} onChangeText={setPassword} secureTextEntry autoCapitalize="none" />
+          <TouchableOpacity onPress={handleSignUp}>
+            <Text>가입하기</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        // 6자리 인증 번호 입력 UI
+        <View>
+          <TextInput placeholder="123456" value={verificationCode} onChangeText={setVerificationCode} keyboardType="number-pad" maxLength={6} />
+          <TouchableOpacity onPress={handleVerify}>
+            <Text>인증 완료</Text>
+          </TouchableOpacity>
+        </View>
+      )}
     </View>
   );
 }
-
-const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-});
 ```
 
-### 7) 모바일에서 백엔드 동기화 및 API 호출
-모바일에서도 로그인 직후 `useAuth` 훅을 통해 JWT 토큰을 취득하고, 백엔드의 `/auth/callback` API로 동기화 요청을 전송합니다.
-```typescript
-import { useAuth } from '@clerk/expo';
-import { useEffect } from 'react';
+### 4) 로그인 및 추가 인증 단계 처리 (`sign-in.jsx`)
+아이디/패스워드로 로그인을 시도하고, 가입 시 이메일 인증을 끝마치지 않았거나 추가 인증 절차가 필요하여 `needs_first_factor` 상태가 반환되면 인증 코드를 가로채서 처리합니다.
+```javascript
+import React, { useState } from "react";
+import { View, Text, TextInput, TouchableOpacity, Alert } from "react-native";
+import { useSignIn, useClerk } from "@clerk/expo";
+import { useRouter } from "expo-router";
 
-export function useSyncUserWithBackend() {
-  const { getToken, isSignedIn } = useAuth();
+export default function SignInScreen() {
+  const { signIn, isLoaded: isSignInLoaded } = useSignIn();
+  const { setActive } = useClerk();
+  const router = useRouter();
 
-  useEffect(() => {
-    const sync = async () => {
-      if (!isSignedIn) return;
-      try {
-        const token = await getToken();
-        
-        // 개발 환경일 경우 localhost 대신 컴퓨터의 실 IP 주소 입력 필수!
-        const response = await fetch('http://192.168.x.x:3000/api/auth/callback', {
-          method: 'GET',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-        });
-        const data = await response.json();
-        console.log('백엔드 동기화 성공:', data);
-      } catch (error) {
-        console.error('백엔드 동기화 실패:', error);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [pendingVerification, setPendingVerification] = useState(false);
+  const [verificationCode, setVerificationCode] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // 1단계: 로그인 시도
+  const handleSignIn = async () => {
+    if (!isSignInLoaded || !signIn) return;
+    setLoading(true);
+    try {
+      const result = await signIn.create({ identifier: email, password });
+
+      // API 결과 중 에러가 있는지 먼저 가드 처리
+      const errorObj = result?.error || (result?.errors && result.errors[0]);
+      if (errorObj) {
+        Alert.alert("로그인 실패", errorObj.message || "비밀번호가 틀렸습니다.");
+        return;
       }
-    };
-    sync();
-  }, [isSignedIn]);
+
+      // [핵심] API 반환객체가 아닌 useSignIn 훅 인스턴스(signIn) 자체의 status를 관측!
+      if (signIn.status === "complete") {
+        await setActive({ session: signIn.createdSessionId });
+        router.replace("/");
+      } else if (signIn.status === "needs_first_factor") {
+        // 이메일 미인증 상태 등의 추가 1차 팩터 요구 시
+        const emailFactor = signIn.supportedFirstFactors?.find(
+          (factor) => factor.strategy === "email_code"
+        );
+        if (emailFactor) {
+          await signIn.prepareFirstFactor({
+            strategy: "email_code",
+            emailAddressId: emailFactor.emailAddressId,
+          });
+          setPendingVerification(true);
+          Alert.alert("인증 코드 발송", "로그인 완수를 위해 이메일로 인증코드가 발송되었습니다.");
+        }
+      } else {
+        Alert.alert("알림", `추가 단계가 필요합니다. (상태: ${signIn.status})`);
+      }
+    } catch (err) {
+      Alert.alert("로그인 실패", err.errors?.[0]?.message || "로그인 요청 실패");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 2단계: 로그인 추가 인증 코드 검증
+  const handleVerify = async () => {
+    if (!signIn) return;
+    setLoading(true);
+    try {
+      await signIn.attemptFirstFactor({ strategy: "email_code", code: verificationCode });
+      if (signIn.status === "complete") {
+        await setActive({ session: signIn.createdSessionId });
+        router.replace("/");
+      } else {
+        Alert.alert("알림", "로그인 상태가 여전히 불완전합니다.");
+      }
+    } catch (err) {
+      Alert.alert("인증 실패", err.errors?.[0]?.message || "잘못된 코드입니다.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    // UI 생략 (SignUp과 유사하게 pendingVerification 분기 렌더링)
+    <View></View>
+  );
 }
 ```
+> [!IMPORTANT]
+> Clerk JS SDK의 동작 철학상 `signIn.create` 또는 `attemptFirstFactor` 등의 비동기 작업 결과 반환되는 객체(`result`)에는 `{ error: null }` 형식만 반환되고 `status` 필드가 누락되어 있을 수 있습니다. 따라서 실제 인증 라이프사이클의 `status` 및 `createdSessionId`는 반드시 **훅으로부터 획득한 `signIn` 변수 자체**에서 추출해 읽어내야 합니다.
 
 ---
 
-## 4단계. 백엔드(Backend) 설정 및 구현
+## 3단계. 백엔드(Backend) 설정 및 구현
 
-클라이언트가 전달한 JWT Bearer 토큰의 서명을 검증하고, 인증 정보를 파싱하여 내부 데이터베이스(MongoDB)와 동기화 및 회원 검증을 수행합니다.
+클라이언트에서 획득한 Bearer JWT 세션 토큰을 검증하고 회원가입 정보를 내부 DB(MongoDB)와 안전하게 동기화합니다.
 
-### 1) 의존성 설치
-백엔드 폴더(`backend/`) 경로에서 Express 및 Node용 Clerk SDK 미들웨어를 설치합니다.
-```bash
-cd backend
-npm install @clerk/express
-```
-
-### 2) 환경 변수 등록
-`backend/.env` 파일에 Clerk에서 복사한 퍼블리셔블 키와 시크릿 키를 정의해 둡니다.
+### 1) 백엔드 Clerk 환경 설정 (`backend/.env`)
 ```env
 CLERK_PUBLISHABLE_KEY=pk_test_...
 CLERK_SECRET_KEY=sk_test_...
 ```
-*(Secret Key는 절대 클라이언트에 유출되어서는 안 되며 백엔드 메모리 내에서만 사용됩니다)*
 
-### 3) Clerk Express 미들웨어 로드 및 서버 시작
-`backend/src/server.js`에 전역 Clerk 미들웨어를 탑재하여, 라우트에 진입하기 전 모든 Request 객체에 Clerk 세션 컨텍스트가 자동으로 부착되도록 만듭니다.
+### 2) Express 서버에 Clerk 미들웨어 등록 (`server.js`)
 ```javascript
-import { clerkMiddleware } from '@clerk/express';
-import express from 'express';
+import express from "express";
+import { clerkMiddleware } from "@clerk/express";
 
 const app = express();
-
-app.use(clerkMiddleware()); // Express Request 객체에 req.auth 세션 컨텍스트 주입
+app.use(express.json());
+app.use(clerkMiddleware()); // 모든 API 요청 헤더의 JWT 서명을 자동 파싱하고 세션 주입
 ```
 
-### 4) 공통 인증 검증 및 MongoDB 동기화 미들웨어 구현 (`protectRoute`)
-백엔드 핵심 파일인 `backend/src/middleware/auth.middleware.js`에서 클라이언트가 전달한 토큰을 기반으로 MongoDB와의 연계를 완수합니다.
+### 3) DB 동기화 검증 미들웨어 구축 (`auth.middleware.js`)
+모든 API 접근 전 토큰 유효성을 판별하고, DB에 가입되지 않은 신규 Clerk 유저를 MongoDB로 인출하여 회원 가입 동기화를 완료합니다.
 ```javascript
-import { clerkClient } from '@clerk/express';
-import { User } from '../models/user.model.js';
+import { clerkClient } from "@clerk/express";
+import { User } from "../models/user.model.js";
 
 export const protectRoute = async (req, res, next) => {
   try {
-    // 1. clerkMiddleware가 가로챈 auth 세션에서 clerkUserId를 확인합니다.
-    const clerkUserId = req.auth.userId;
-    
+    const clerkUserId = req.auth.userId; // JWT 해독을 통해 추출된 유저 ID
     if (!clerkUserId) {
-      return res.status(401).json({ message: "로그인이 필요한 서비스입니다. (Unauthorized)" });
+      return res.status(401).json({ message: "인증 정보가 만료되었습니다." });
     }
 
-    // 2. MongoDB 데이터베이스에 해당 유저가 가입되어 있는지 조회합니다.
+    // 1. MongoDB에서 해당 사용자 조회
     let user = await User.findOne({ clerkId: clerkUserId });
 
-    // 3. 만약 최초 로그인하여 DB에 정보가 없다면, Clerk API 서버에서 직접 프로필 상세를 내려받아 DB에 생성(동기화)합니다.
+    // 2. 가입되지 않은 유저인 경우 (최초 로그인) Clerk API를 호출하여 DB 가입 처리
     if (!user) {
-      // Clerk Client를 통해 해당 사용자 객체 조회
       const clerkUser = await clerkClient.users.getUser(clerkUserId);
-      
       const email = clerkUser.emailAddresses[0]?.emailAddress;
-      const fullName = `${clerkUser.firstName || ""} ${clerkUser.lastName || ""}`.trim() || "User";
+      const fullName = `${clerkUser.firstName || ""} ${clerkUser.lastName || ""}`.trim() || "사용자";
       const imageUrl = clerkUser.imageUrl;
 
       user = await User.create({
         clerkId: clerkUserId,
         fullName,
         imageUrl,
-        email
+        email,
       });
-      console.log(`[Sync] 신규 유저 생성 완료: ${fullName}`);
+      console.log(`[Sync Success] MongoDB 신규 동기화 완료: ${fullName}`);
     }
 
-    // 4. 조회되거나 새로 가입된 Mongoose User 객체를 req.currentUser에 할당하여 다음 컨트롤러가 활용할 수 있게 합니다.
-    req.currentUser = user;
+    req.currentUser = user; // 후속 라우트 컨트롤러에 주입
     next();
   } catch (error) {
-    console.error("인증 처리 중 에러 발생:", error);
-    res.status(500).json({ message: "서버 인증 과정에서 오류가 발생했습니다." });
-  }
-};
-```
-
-### 5) 동기화 콜백 API 엔드포인트 바인딩 (`auth.controller.js`)
-최초 가입 처리 또는 로그인 정보 갱신을 위해 프론트엔드가 보낸 `/auth/callback` 요청을 수신하는 컨트롤러입니다. 이미 `protectRoute` 미들웨어에서 모든 동기화 로직을 보장하므로 컨트롤러는 응답 코드만 리턴해 줍니다:
-```javascript
-// auth.controller.js
-export const authCallback = async (req, res, next) => {
-  try {
-    // protectRoute가 이미 req.currentUser를 안전하게 검증/생성하여 꽂아준 상태입니다.
-    res.status(200).json({ success: true, user: req.currentUser });
-  } catch (error) {
-    next(error);
+    console.error("인증 검증 에러:", error);
+    res.status(500).json({ message: "서버 내부 인증 오류" });
   }
 };
 ```
 
 ---
 
-## 5단계. 최종 점검 사항 (Troubleshooting)
+## 4단계. 모바일 API 통신 설계 및 타임아웃 예외 처리 (`index.tsx`)
 
-1. **토큰 만료 혹은 헤더 누락**: 
-   - 프론트엔드(웹/모바일)에서 API 통신 직전에 반드시 `await getToken()`으로 발급받은 최신 유효 토큰을 `Authorization` Bearer 헤더에 갱신 주입했는지 점검하십시오.
-2. **모바일 개발 시 `localhost` 접속 에러**:
-   - 모바일 에뮬레이터나 실기기는 PC의 `localhost`를 직접 참조하지 못합니다. 모바일에서 백엔드를 호출할 때 API의 Endpoint를 반드시 컴퓨터의 로컬 IP(예: `http://192.168.0.2:3000`)로 설정하십시오.
-3. **CORS 허용**:
-   - 로컬 개발 환경 통신 시, 백엔드 서버에 프론트엔드 출처(웹: `http://localhost:5173`, 모바일: Expo의 포트 등)가 CORS 허용 리스트에 명시되어 있어야 인증 토큰 헤더가 거부되지 않습니다.
-4. **Redirect Scheme 불일치**:
-   - Expo 모바일 인증 완료 시, `app.json`에 정의한 `scheme`과 `useSSO`에 보낸 `redirectUrl`의 scheme이 완벽히 일치해야 웹 브라우저에서 다시 Native 앱으로 튕겨져 돌아오게 됩니다.
-5. **어드민 권한 통제**:
-   - 특정 유저에게 어드민 권한을 부여하고 싶다면, `backend/.env` 파일의 `ADMIN_EMAIL`에 해당 유저의 Clerk 가입 이메일 주소를 등록하면 백엔드 미들웨어에서 관리자 권한 관련 제어가 활성화됩니다.
+모바일에서 백엔드 데이터를 가져올 때 잘못된 서버 IP나 일시적인 망 장애로 인해 화면에 로딩 인디케이터가 갇혀 굳어버리는(무한 스핀) 현상을 예방하기 위해, `AbortController`를 이용해 **최대 8초 내외의 네트워크 타임아웃** 방어벽을 추가합니다.
+
+```typescript
+import React, { useEffect, useState, useCallback } from "react";
+import { View, ActivityIndicator, Alert } from "react-native";
+import { useUser } from "@clerk/expo";
+import { API_ENDPOINTS } from "../../constants/api";
+
+export default function DashboardScreen() {
+  const { user, isLoaded: isUserLoaded } = useUser();
+  const [loading, setLoading] = useState(true);
+
+  const fetchTransactions = useCallback(async () => {
+    if (!user?.id) return;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000); // 8초 제한 시간
+
+    try {
+      const response = await fetch(`${API_ENDPOINTS.transactions}/${user.id}`, {
+        signal: controller.signal, // 시그널 바인딩
+      });
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) throw new Error("조회 실패");
+      const data = await response.json();
+      // 데이터 바인딩 로직...
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      console.error("거래내역 조회 에러:", error);
+      if (error.name === "AbortError") {
+        console.warn("⚠️ 네트워크 요청이 8초를 초과하여 강제 중단되었습니다.");
+      }
+    }
+  }, [user?.id]);
+
+  const loadAllData = useCallback(async () => {
+    setLoading(true);
+    await fetchTransactions(); // 기타 API도 함께 호출
+    setLoading(false);
+  }, [fetchTransactions]);
+
+  useEffect(() => {
+    if (isUserLoaded && user?.id) {
+      loadAllData();
+    }
+  }, [isUserLoaded, user?.id, loadAllData]);
+
+  if (!isUserLoaded || !user?.id || loading) {
+    return <ActivityIndicator size="large" />;
+  }
+
+  return (
+    // 대시보드 UI
+    <View></View>
+  );
+}
+```
+
+---
+
+## 5단계. 치명적 오류 트러블슈팅 및 예방 체크리스트
+
+### 1) React Native 디버거 가로채기(Network Inspection) 버그
+* **현상**: 로그인 시도 시 `result.status`가 `undefined`로 조회되고, 응답 데이터가 `{ "error": null }` 처럼 비정상적인 빈 객체로 수신되는 경우.
+* **원인**: Flipper, React DevTools, Chrome Inspect 등의 툴에서 HTTP 네트워크 패킷 가로채기(Network Inspection)가 켜져 있으면, Clerk SDK의 보안 인증 응답 바디를 정상 캡처하지 못하고 런타임 메모리에서 응답 본문을 소멸시켜 버리는 고질적인 버그입니다.
+* **조치**: 시뮬레이터 개발자 메뉴(`Cmd + D` 혹은 터미널 `d`)를 열어 **"Stop Debugging"** 또는 **"Disable Network Inspection"**을 활성화해 디버깅 감시 툴을 끈 상태로 구동하십시오.
+
+### 2) 개발 장비 IP 변경 및 SYN_SENT 대기 오류
+* **현상**: 모바일 앱 구동 시 로딩 화면(스피너)에 갇힌 채 응답이 전혀 없고, 터미널 소켓 모니터링 시 `SYN_SENT` 대기열이 생성되는 경우.
+* **원인**: Wi-Fi 등 네트워크 망 변경으로 개발 장비(PC/Mac)의 실제 로컬 IP 주소가 변경되었으나, 앱의 API 주소 상수가 예전 IP로 하드코딩되어 있어서 패킷을 엉뚱한 목적지로 계속 송신하여 응답을 대기 중인 상태입니다.
+* **조치**: 
+  1. 맥북 터미널에서 `ifconfig` 명령어로 현재 en0 등 활성 Wi-Fi 어댑터의 IP(예: `192.168.x.x`)를 파악합니다.
+  2. `mobile/constants/api.js` 내의 `API_BASE_URL` IP를 해당 값으로 수정합니다.
+  3. Metro 번들러가 새 IP를 캐싱하여 무시하는 것을 방지하기 위해 반드시 **캐시 청소 옵션을 달아 메트로 서버를 재기동**합니다:
+     ```bash
+     npx expo start -c
+     ```
+  4. 시뮬레이터의 앱을 강제 종료하고 다시 실행합니다.
